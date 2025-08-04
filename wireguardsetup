@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+A command-line tool to simplify the installation and management of WireGuard.
+This script automates the setup of a WireGuard server and the creation of peer configurations.
+"""
+
+import os
+import subprocess
+import sys
+import platform
+import configparser
+import shutil
+
+# --- Configuration ---
+CONFIG_DIR = "/etc/wireguard/"
+SERVER_CONFIG_FILE = os.path.join(CONFIG_DIR, "wg0.conf")
+PEER_CONFIG_DIR = os.path.join(CONFIG_DIR, "peers")
+
+def check_root():
+    """Check if the script is running as root."""
+    if os.geteuid() != 0:
+        print("\n[!] This script must be run as root. Please use 'sudo'.")
+        sys.exit(1)
+
+def get_distro():
+    """Detect the Linux distribution."""
+    try:
+        return platform.freedesktop_os_release().get('ID')
+    except AttributeError:
+        # Fallback for older systems
+        if os.path.exists('/etc/lsb-release'):
+            with open('/etc/lsb-release', 'r') as f:
+                for line in f:
+                    if line.startswith('DISTRIB_ID='):
+                        return line.split('=')[1].strip().lower()
+        elif os.path.exists('/etc/os-release'):
+             with open('/etc/os-release', 'r') as f:
+                for line in f:
+                    if line.startswith('ID='):
+                        return line.split('=')[1].strip().lower()
+        return None
+
+
+def install_wireguard():
+    """Install WireGuard and dependencies based on the detected Linux distribution."""
+    print("\n[*] Installing WireGuard...")
+    distro = get_distro()
+
+    if distro in ['ubuntu', 'debian']:
+        subprocess.run(["apt-get", "update"], check=True, capture_output=True)
+        subprocess.run(["apt-get", "install", "-y", "wireguard", "qrencode", "iptables"], check=True)
+    elif distro in ['centos', 'rhel', 'fedora']:
+        subprocess.run(["yum", "install", "-y", "elrepo-release", "epel-release"], check=True, capture_output=True)
+        subprocess.run(["yum", "install", "-y", "yum-plugin-elrepo"], check=True, capture_output=True)
+        subprocess.run(["yum", "install", "-y", "kmod-wireguard", "wireguard-tools", "qrencode", "iptables"], check=True, capture_output=True)
+    elif distro == 'arch':
+        subprocess.run(["pacman", "-Syu", "--noconfirm", "wireguard-tools", "qrencode", "iptables"], check=True)
+    else:
+        print(f"\n[!] Unsupported distribution: {distro}. Please install WireGuard manually.")
+        sys.exit(1)
+
+    print("\n[+] WireGuard and dependencies installed successfully.")
+    # Create peer directory
+    os.makedirs(PEER_CONFIG_DIR, exist_ok=True)
+
+
+def get_public_ip():
+    """Get the server's public IP address."""
+    try:
+        # Use a reliable service to get the IP
+        ip = subprocess.check_output(["curl", "-s", "https://api.ipify.org"]).decode().strip()
+        return ip
+    except Exception as e:
+        print(f"\n[!] Could not determine public IP: {e}")
+        return input("Please enter your server's public IP address manually: ")
+
+def get_primary_interface():
+    """Get the primary network interface name."""
+    try:
+        # Command to find the default route's interface
+        cmd = "ip -4 route ls | grep default | grep -Po '(?<=dev )(\\S+)'"
+        interface = subprocess.check_output(cmd, shell=True).decode().strip()
+        return interface
+    except Exception as e:
+        print(f"\n[!] Could not determine primary network interface: {e}")
+        return input("Please enter your primary network interface name manually (e.g., eth0): ")
+
+def configure_server():
+    """Configure the WireGuard server with firewall rules."""
+    if os.path.exists(SERVER_CONFIG_FILE):
+        print("\n[!] Server seems to be already configured. If you want to re-configure, please run the 'Full Wipe' option first.")
+        return
+
+    print("\n[*] Configuring WireGuard server...")
+
+    # Generate server keys
+    privkey = subprocess.check_output("wg genkey", shell=True).decode().strip()
+    pubkey = subprocess.check_output(f"echo '{privkey}' | wg pubkey", shell=True).decode().strip()
+
+    # Get server details
+    public_ip = get_public_ip()
+    primary_interface = get_primary_interface()
+    listen_port = input("Enter a port for WireGuard to listen on (e.g., 51820): ") or "51820"
+    
+    # Let user choose from a list of IPs or enter a custom one
+    ip_options = ["10.0.0.", "10.10.10.", "192.168.100.", "172.16.0."]
+    print("\nPlease select a base IP for the VPN subnet:")
+    for i, ip in enumerate(ip_options, 1):
+        print(f"  {i}. {ip}x")
+    print(f"  {len(ip_options) + 1}. Enter a custom base IP")
+
+    vpn_ip_base = ""
+    while not vpn_ip_base:
+        try:
+            choice = int(input(f"Enter your choice [1-{len(ip_options) + 1}]: "))
+            if 1 <= choice <= len(ip_options):
+                vpn_ip_base = ip_options[choice - 1]
+            elif choice == len(ip_options) + 1:
+                custom_ip = input("Enter the custom base IP for the VPN subnet (e.g., 10.99.1.): ")
+                if custom_ip.endswith('.'):
+                    vpn_ip_base = custom_ip
+                else:
+                    print("\n[!] Custom IP must end with a dot ('.'). Please try again.")
+            else:
+                print("\n[!] Invalid choice. Please try again.")
+        except ValueError:
+            print("\n[!] Invalid input. Please enter a number.")
+
+    # Define PostUp and PostDown firewall rules for NAT, escaping the '%' for configparser
+    post_up = f"iptables -A FORWARD -i %%i -j ACCEPT; iptables -t nat -A POSTROUTING -o {primary_interface} -j MASQUERADE"
+    post_down = f"iptables -D FORWARD -i %%i -j ACCEPT; iptables -t nat -D POSTROUTING -o {primary_interface} -j MASQUERADE"
+
+    config = configparser.ConfigParser()
+    config.optionxform = str # Preserve case for keys
+    config['Interface'] = {
+        'Address': f'{vpn_ip_base}1/24',
+        'SaveConfig': 'true',
+        'ListenPort': listen_port,
+        'PrivateKey': privkey,
+        'PostUp': post_up,
+        'PostDown': post_down
+    }
+
+    with open(SERVER_CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
+
+    # Enable IP forwarding
+    print("[*] Enabling IP forwarding...")
+    subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], check=True)
+    # Make IP forwarding persistent
+    with open('/etc/sysctl.conf', 'r+') as f:
+        content = f.read()
+        if 'net.ipv4.ip_forward=1' not in content:
+            f.write('\nnet.ipv4.ip_forward=1\n')
+
+    # Start and enable WireGuard service
+    print("[*] Starting and enabling WireGuard service...")
+    subprocess.run(["systemctl", "start", "wg-quick@wg0"], check=True)
+    subprocess.run(["systemctl", "enable", "wg-quick@wg0"], check=True)
+
+    print("\n[+] Server configured successfully.")
+    print(f"[i] Your server's public key is: {pubkey}")
+    print("[i] Remember to set up port forwarding on your router for UDP port", listen_port)
+
+
+def add_peer():
+    """Add a new peer to the WireGuard server."""
+    if not os.path.exists(SERVER_CONFIG_FILE):
+        print("\n[!] Server not configured yet. Please configure the server first.")
+        return
+
+    print("\n[*] Adding a new WireGuard peer...")
+    peer_name = input("Enter a name for the new peer (e.g., my-phone): ")
+    if not peer_name or ' ' in peer_name:
+        print("\n[!] Peer name cannot be empty or contain spaces.")
+        return
+
+    # Generate peer keys
+    privkey = subprocess.check_output("wg genkey", shell=True).decode().strip()
+    pubkey = subprocess.check_output(f"echo '{privkey}' | wg pubkey", shell=True).decode().strip()
+
+    # Determine next available IP
+    server_config = configparser.ConfigParser()
+    server_config.read(SERVER_CONFIG_FILE)
+    vpn_ip_base = '.'.join(server_config['Interface']['Address'].split('.')[:3]) + '.'
+    
+    # Find existing peer IPs by checking the live interface config
+    existing_ips = []
+    try:
+        output = subprocess.check_output("wg show wg0 allowed-ips", shell=True).decode()
+        for line in output.strip().split('\n'):
+            parts = line.split()
+            # Ensure the line has at least two parts before trying to access an index
+            if len(parts) >= 2:
+                existing_ips.append(parts[1].split('/')[0])
+    except subprocess.CalledProcessError:
+        # This error can happen if the interface is down or doesn't exist.
+        # It's safe to assume no peers exist in this case.
+        pass
+    
+    existing_ips.append(f"{vpn_ip_base}1") # Add server IP
+
+    next_ip_num = 2
+    while f"{vpn_ip_base}{next_ip_num}" in existing_ips:
+        next_ip_num += 1
+    peer_vpn_ip = f"{vpn_ip_base}{next_ip_num}"
+
+
+    # Add peer to server config using wg command for safety
+    subprocess.run(f"wg set wg0 peer {pubkey} allowed-ips {peer_vpn_ip}/32", shell=True, check=True)
+    
+    # Create peer config file
+    peer_config_path = os.path.join(PEER_CONFIG_DIR, f"{peer_name}.conf")
+    server_pubkey = subprocess.check_output(f"wg show wg0 public-key", shell=True).decode().strip()
+    server_endpoint = f"{get_public_ip()}:{server_config['Interface']['ListenPort']}"
+
+    peer_config = configparser.ConfigParser()
+    peer_config.optionxform = str
+    peer_config['Interface'] = {
+        'PrivateKey': privkey,
+        'Address': f'{peer_vpn_ip}/24',
+        'DNS': '1.1.1.1, 9.9.9.9' # Updated DNS servers
+    }
+    peer_config['Peer'] = {
+        'PublicKey': server_pubkey,
+        'Endpoint': server_endpoint,
+        'AllowedIPs': '0.0.0.0/0, ::/0', # Route all traffic through VPN
+        'PersistentKeepalive': '25'
+    }
+
+    with open(peer_config_path, 'w') as configfile:
+        peer_config.write(configfile)
+
+    print(f"\n[+] Peer '{peer_name}' added successfully.")
+    print(f"   - Configuration file saved at: {peer_config_path}")
+    print(f"   - VPN IP: {peer_vpn_ip}")
+    
+    # Display QR code
+    try:
+        print("\n[i] Scan this QR code with the WireGuard mobile app:")
+        subprocess.run(["qrencode", "-t", "ansiutf8", "-r", peer_config_path], check=True)
+    except FileNotFoundError:
+        print("\n[!] 'qrencode' is not installed. Cannot display QR code.")
+        print("    You can install it with 'sudo apt-get install qrencode' or your package manager.")
+    except Exception as e:
+        print(f"\n[!] Could not generate QR code: {e}")
+
+
+def remove_peer():
+    """Remove a peer from the WireGuard server."""
+    if not os.path.exists(SERVER_CONFIG_FILE):
+        print("\n[!] Server not configured yet.")
+        return
+
+    print("\n[*] Removing a WireGuard peer...")
+
+    # List peers from their config files
+    peer_files = [f for f in os.listdir(PEER_CONFIG_DIR) if f.endswith('.conf')]
+    if not peer_files:
+        print("\n[i] No peer configuration files found to remove.")
+        return
+
+    print("Available peers to remove:")
+    for i, peer_file in enumerate(peer_files, 1):
+        print(f"  {i}. {peer_file.replace('.conf', '')}")
+
+    try:
+        choice = int(input("Enter the number of the peer to remove: "))
+        if not 1 <= choice <= len(peer_files):
+            print("\n[!] Invalid choice.")
+            return
+        peer_to_remove = peer_files[choice - 1]
+        peer_name_to_remove = peer_to_remove.replace('.conf', '')
+    except (ValueError, IndexError):
+        print("\n[!] Invalid input.")
+        return
+
+    # Get public key from peer config file
+    peer_config_path = os.path.join(PEER_CONFIG_DIR, peer_to_remove)
+    peer_conf = configparser.ConfigParser()
+    peer_conf.read(peer_config_path)
+    try:
+        peer_ip = peer_conf['Interface']['Address'].split('/')[0]
+        
+        output = subprocess.check_output("wg show wg0 dump", shell=True).decode().strip().split('\n')
+        peer_pubkey = None
+        for line in output[1:]: # Skip header
+             parts = line.split('\t')
+             if len(parts) > 3 and parts[3].split('/')[0] == peer_ip:
+                 peer_pubkey = parts[0]
+                 break
+        
+        if not peer_pubkey:
+            print(f"[!] Could not find public key for peer with IP {peer_ip}. Manual removal may be needed.")
+            return
+
+        # Remove peer using wg command
+        subprocess.run(f"wg set wg0 peer {peer_pubkey} remove", shell=True, check=True)
+        # Remove peer config file
+        os.remove(peer_config_path)
+        print(f"\n[+] Peer '{peer_name_to_remove}' removed successfully.")
+
+    except (configparser.NoSectionError, configparser.NoOptionError, subprocess.CalledProcessError) as e:
+        print(f"[!] Error removing peer '{peer_name_to_remove}': {e}")
+        print("    The peer config file might be corrupt or the peer may not exist on the server.")
+
+
+def view_configs():
+    """View server and peer configurations."""
+    print("\n--- Server Configuration (wg0.conf) ---")
+    if os.path.exists(SERVER_CONFIG_FILE):
+        try:
+            # Use wg showconf for the live, saved config
+            live_conf = subprocess.check_output("wg showconf wg0", shell=True).decode()
+            print(live_conf)
+        except subprocess.CalledProcessError:
+            print("[!] Could not get live config. Showing file content instead.")
+            with open(SERVER_CONFIG_FILE, 'r') as f:
+                print(f.read())
+    else:
+        print("[i] Server not configured yet.")
+
+    print("\n--- Peer Configurations (peers/) ---")
+    if os.path.exists(PEER_CONFIG_DIR) and os.listdir(PEER_CONFIG_DIR):
+        for filename in sorted(os.listdir(PEER_CONFIG_DIR)):
+            print(f"\n--- Peer: {filename} ---")
+            with open(os.path.join(PEER_CONFIG_DIR, filename), 'r') as f:
+                print(f.read())
+    else:
+        print("[i] No peers have been added yet.")
+
+def refresh_and_fix_server():
+    """Refreshes firewall rules and applies the current config."""
+    if not os.path.exists(SERVER_CONFIG_FILE):
+        print("\n[!] Server not configured yet. Nothing to fix.")
+        return
+
+    print("\n[*] Refreshing and fixing server configuration...")
+    
+    # Read existing config to preserve essential data
+    config = configparser.ConfigParser()
+    config.read(SERVER_CONFIG_FILE)
+    
+    try:
+        # Re-detect primary interface for firewall rules
+        primary_interface = get_primary_interface()
+        print(f"[*] Detected primary interface: {primary_interface}")
+
+        # Re-generate firewall rules, escaping the '%' for configparser
+        post_up = f"iptables -A FORWARD -i %%i -j ACCEPT; iptables -t nat -A POSTROUTING -o {primary_interface} -j MASQUERADE"
+        post_down = f"iptables -D FORWARD -i %%i -j ACCEPT; iptables -t nat -D POSTROUTING -o {primary_interface} -j MASQUERADE"
+        
+        config.set('Interface', 'PostUp', post_up)
+        config.set('Interface', 'PostDown', post_down)
+
+        # Rewrite the config file with the corrected rules
+        with open(SERVER_CONFIG_FILE, 'w') as configfile:
+            config.write(configfile)
+        
+        print("[*] Server configuration file updated with correct firewall rules.")
+
+        # Restart the service to apply changes
+        print("[*] Restarting WireGuard service to apply changes...")
+        subprocess.run(["systemctl", "restart", "wg-quick@wg0"], check=True)
+
+        print("\n[+] Server refresh complete. Also, check that your peer configs have the correct public IP if it has changed.")
+        print(f"    Current Public IP: {get_public_ip()}")
+
+    except (configparser.NoSectionError, configparser.NoOptionError) as e:
+        print(f"\n[!] Error reading server config: {e}. It might be corrupted.")
+    except subprocess.CalledProcessError as e:
+        print(f"\n[!] Error restarting WireGuard service: {e}")
+    except Exception as e:
+        print(f"\n[!] An unexpected error occurred: {e}")
+
+def full_wipe():
+    """Completely remove WireGuard, all configs, and system changes."""
+    print("\n[!] WARNING: This will perform a full wipe. It will stop WireGuard, remove all configurations,")
+    print("             uninstall the package, and revert system changes (like IP forwarding).")
+    confirm = input("Are you absolutely sure you want to continue? [y/N]: ").lower()
+    if confirm != 'y':
+        print("\n[*] Wipe cancelled.")
+        return
+
+    print("\n[*] Wiping WireGuard installation...")
+
+    # Stop and disable service
+    if os.path.exists(SERVER_CONFIG_FILE):
+        print("[*] Stopping and disabling WireGuard service...")
+        subprocess.run(["systemctl", "stop", "wg-quick@wg0"], check=False, capture_output=True)
+        subprocess.run(["systemctl", "disable", "wg-quick@wg0"], check=False, capture_output=True)
+
+    # Remove configuration files
+    if os.path.exists(CONFIG_DIR):
+        print(f"[*] Removing configuration directory: {CONFIG_DIR}")
+        shutil.rmtree(CONFIG_DIR)
+
+    # Revert IP forwarding
+    sysctl_path = '/etc/sysctl.conf'
+    if os.path.exists(sysctl_path):
+        print(f"[*] Reverting IP forwarding setting in {sysctl_path}...")
+        try:
+            # Create a backup before modifying
+            shutil.copy2(sysctl_path, f"{sysctl_path}.bak.{os.getpid()}")
+            with open(sysctl_path, 'r') as f_in:
+                lines = [line for line in f_in if 'net.ipv4.ip_forward=1' not in line.strip()]
+            with open(sysctl_path, 'w') as f_out:
+                f_out.writelines(lines)
+            # Apply the changes immediately
+            subprocess.run(["sysctl", "-p"], check=False, capture_output=True)
+        except Exception as e:
+            print(f"[!] Failed to modify {sysctl_path}: {e}")
+
+    # Uninstall package
+    print("[*] Uninstalling WireGuard packages...")
+    distro = get_distro()
+    try:
+        if distro in ['ubuntu', 'debian']:
+            subprocess.run(["apt-get", "purge", "-y", "wireguard", "wireguard-tools"], check=True, capture_output=True)
+            subprocess.run(["apt-get", "autoremove", "-y"], check=True, capture_output=True)
+        elif distro in ['centos', 'rhel', 'fedora']:
+            subprocess.run(["yum", "remove", "-y", "kmod-wireguard", "wireguard-tools"], check=True, capture_output=True)
+        elif distro == 'arch':
+            subprocess.run(["pacman", "-Rns", "--noconfirm", "wireguard-tools"], check=True, capture_output=True)
+    except Exception as e:
+        print(f"[!] Failed to uninstall packages: {e}")
+    
+    print("\n[+] WireGuard has been completely wiped from the system.")
+
+def main_menu():
+    """Display the main menu and handle user input."""
+    while True:
+        print("\n--- WireGuard Easy Setup ---")
+        print("1. Install WireGuard")
+        print("2. Configure Server (run this first)")
+        print("3. Add Peer")
+        print("4. Remove Peer")
+        print("5. View Configurations")
+        print("6. Refresh & Fix Server Config")
+        print("7. Full Wipe & Reset")
+        print("8. Exit")
+        choice = input("Enter your choice: ")
+
+        if choice == '1':
+            install_wireguard()
+        elif choice == '2':
+            configure_server()
+        elif choice == '3':
+            add_peer()
+        elif choice == '4':
+            remove_peer()
+        elif choice == '5':
+            view_configs()
+        elif choice == '6':
+            refresh_and_fix_server()
+        elif choice == '7':
+            full_wipe()
+        elif choice == '8':
+            print("\nGoodbye!\n")
+            break
+        else:
+            print("\n[!] Invalid choice. Please try again.")
+
+if __name__ == "__main__":
+    check_root()
+    main_menu()
+
