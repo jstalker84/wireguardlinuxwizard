@@ -44,19 +44,19 @@ You can clone the repository:
 
 Bash
 
-git clone https://github.com/your-username/your-repository-name.git [cite: 24]
-cd your-repository-name [cite: 25]
+git clone https://github.com/your-username/your-repository-name.git 
+cd your-repository-name 
 Alternatively, you can download the script directly:
 
 Bash
 
-wget https://raw.githubusercontent.com/your-username/your-repository-name/main/wireguardsetup.py [cite: 27, 28, 29]
-chmod +x wireguardsetup.py [cite: 29]
+wget https://raw.githubusercontent.com/your-username/your-repository-name/main/wireguardsetup.py 
+chmod +x wireguardsetup.py 
 2. Run the script with sudo: 
 
 Bash
 
-sudo ./wireguardsetup.py [cite: 31]
+sudo ./wireguardsetup.py 
 Menu Options 
 
 1. Install WireGuard
