@@ -13,14 +13,23 @@ import platform
 import configparser
 import shutil
 
+# --- OS Detection ---
+IS_WINDOWS = platform.system().lower() == "windows"
+IS_LINUX = platform.system().lower() == "linux"
+
 # --- Configuration ---
-CONFIG_DIR = "/etc/wireguard/"
-SERVER_CONFIG_FILE = os.path.join(CONFIG_DIR, "wg0.conf")
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), "WireGuard") if IS_WINDOWS else "/etc/wireguard/"
+SERVER_CONFIG_FILE = os.path.join(CONFIG_DIR, "wg0.conf")  # Only meaningful on Linux
 PEER_CONFIG_DIR = os.path.join(CONFIG_DIR, "peers")
 
+# Ensure base directories exist where safe (Windows; on Linux only create peers dir when installing)
+os.makedirs(PEER_CONFIG_DIR, exist_ok=True)
+
 def check_root():
-    """Check if the script is running as root."""
-    if os.geteuid() != 0:
+    """Check if the script is running as root (Linux only)."""
+    if IS_WINDOWS:
+        return
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
         print("\n[!] This script must be run as root. Please use 'sudo'.")
         sys.exit(1)
 
@@ -45,6 +54,9 @@ def get_distro():
 
 def install_wireguard():
     """Install WireGuard and dependencies based on the detected Linux distribution."""
+    if IS_WINDOWS:
+        print("\n[!] Install is only supported on Linux. On Windows, please install WireGuard from the official installer and use the Windows app.")
+        return
     print("\n[*] Installing WireGuard...")
     distro = get_distro()
 
@@ -89,21 +101,28 @@ def get_primary_interface():
 
 def configure_server():
     """Configure the WireGuard server with firewall rules."""
+    if IS_WINDOWS:
+        print("\n[!] Server configuration is only supported on Linux. On Windows, consider using WSL or a Linux server.")
+        return
     if os.path.exists(SERVER_CONFIG_FILE):
         print("\n[!] Server seems to be already configured. If you want to re-configure, please run the 'Full Wipe' option first.")
         return
 
     print("\n[*] Configuring WireGuard server...")
 
-    # Generate server keys
-    privkey = subprocess.check_output("wg genkey", shell=True).decode().strip()
-    pubkey = subprocess.check_output(f"echo '{privkey}' | wg pubkey", shell=True).decode().strip()
+    try:
+        # Generate server keys
+        privkey = subprocess.check_output("wg genkey", shell=True).decode().strip()
+        pubkey = subprocess.check_output(f"echo '{privkey}' | wg pubkey", shell=True).decode().strip()
+    except subprocess.CalledProcessError as e:
+        print(f"\n[!] Failed to generate WireGuard keys: {e}")
+        return
 
     # Get server details
     public_ip = get_public_ip()
     primary_interface = get_primary_interface()
     listen_port = input("Enter a port for WireGuard to listen on (e.g., 51820): ") or "51820"
-    
+
     # Let user choose from a list of IPs or enter a custom one
     ip_options = ["10.0.0.", "10.10.10.", "192.168.100.", "172.16.0."]
     print("\nPlease select a base IP for the VPN subnet:")
@@ -143,6 +162,9 @@ def configure_server():
         'PostDown': post_down
     }
 
+    # Ensure Linux config directory exists
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
     with open(SERVER_CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
 
@@ -167,6 +189,9 @@ def configure_server():
 
 def add_peer():
     """Add a new peer to the WireGuard server."""
+    if IS_WINDOWS:
+        print("\n[!] Adding a peer to the server is only supported on Linux. On Windows, use 'Generate Client Config'.")
+        return
     if not os.path.exists(SERVER_CONFIG_FILE):
         print("\n[!] Server not configured yet. Please configure the server first.")
         return
@@ -185,7 +210,7 @@ def add_peer():
     server_config = configparser.ConfigParser()
     server_config.read(SERVER_CONFIG_FILE)
     vpn_ip_base = '.'.join(server_config['Interface']['Address'].split('.')[:3]) + '.'
-    
+
     # Find existing peer IPs by checking the live interface config
     existing_ips = []
     try:
@@ -199,7 +224,7 @@ def add_peer():
         # This error can happen if the interface is down or doesn't exist.
         # It's safe to assume no peers exist in this case.
         pass
-    
+
     existing_ips.append(f"{vpn_ip_base}1") # Add server IP
 
     next_ip_num = 2
@@ -210,7 +235,7 @@ def add_peer():
 
     # Add peer to server config using wg command for safety
     subprocess.run(f"wg set wg0 peer {pubkey} allowed-ips {peer_vpn_ip}/32", shell=True, check=True)
-    
+
     # Create peer config file
     peer_config_path = os.path.join(PEER_CONFIG_DIR, f"{peer_name}.conf")
     server_pubkey = subprocess.check_output(f"wg show wg0 public-key", shell=True).decode().strip()
@@ -236,7 +261,7 @@ def add_peer():
     print(f"\n[+] Peer '{peer_name}' added successfully.")
     print(f"   - Configuration file saved at: {peer_config_path}")
     print(f"   - VPN IP: {peer_vpn_ip}")
-    
+
     # Display QR code
     try:
         print("\n[i] Scan this QR code with the WireGuard mobile app:")
@@ -247,9 +272,84 @@ def add_peer():
     except Exception as e:
         print(f"\n[!] Could not generate QR code: {e}")
 
+# --- Windows helpers ---
+
+def generate_client_config_windows():
+    """Generate a WireGuard client configuration on Windows and optionally show a QR code."""
+    if not IS_WINDOWS:
+        print("\n[i] This option is intended for Windows hosts.")
+        return
+
+    print("\n[*] Generate WireGuard client configuration (Windows)")
+    peer_name = input("Enter a name for this client (e.g., my-laptop): ") or "client"
+    server_public_key = input("Enter the server's public key: ").strip()
+    endpoint = input("Enter the server endpoint (e.g., 203.0.113.10:51820): ").strip()
+    allowed_ips = input("Allowed IPs [default 0.0.0.0/0, ::/0]: ").strip() or '0.0.0.0/0, ::/0'
+    dns = input("DNS [default 1.1.1.1, 9.9.9.9]: ").strip() or '1.1.1.1, 9.9.9.9'
+    address = input("Client VPN Address (e.g., 10.0.0.2/24): ").strip()
+
+    if not server_public_key or not endpoint or not address:
+        print("\n[!] Missing required fields. Aborting.")
+        return
+
+    # Generate client private/public keys using wg if available, else prompt
+    try:
+        privkey = subprocess.check_output("wg genkey", shell=True).decode().strip()
+    except Exception:
+        print("[!] 'wg' not found. Please enter a pre-generated private key.")
+        privkey = input("Private key: ").strip()
+        if not privkey:
+            print("[!] No private key provided. Aborting.")
+            return
+
+    # Build config
+    peer_config = configparser.ConfigParser()
+    peer_config.optionxform = str
+    peer_config['Interface'] = {
+        'PrivateKey': privkey,
+        'Address': address,
+        'DNS': dns
+    }
+    peer_config['Peer'] = {
+        'PublicKey': server_public_key,
+        'Endpoint': endpoint,
+        'AllowedIPs': allowed_ips,
+        'PersistentKeepalive': '25'
+    }
+
+    # Save under user's WireGuard directory
+    os.makedirs(PEER_CONFIG_DIR, exist_ok=True)
+    peer_config_path = os.path.join(PEER_CONFIG_DIR, f"{peer_name}.conf")
+    with open(peer_config_path, 'w') as f:
+        peer_config.write(f)
+
+    print(f"\n[+] Client configuration saved to: {peer_config_path}")
+    try:
+        print("\n[i] QR code for quick import (if 'qrencode' is installed):")
+        subprocess.run(["qrencode", "-t", "ansiutf8", "-r", peer_config_path], check=True)
+    except Exception:
+        print("[i] Skipping QR code display (requires 'qrencode').")
+
+
+def view_local_configs_windows():
+    if not IS_WINDOWS:
+        print("\n[i] This option is intended for Windows hosts.")
+        return
+    print("\n--- Local Client Configurations ---")
+    if os.path.exists(PEER_CONFIG_DIR) and os.listdir(PEER_CONFIG_DIR):
+        for filename in sorted(os.listdir(PEER_CONFIG_DIR)):
+            print(f"\n--- {filename} ---")
+            with open(os.path.join(PEER_CONFIG_DIR, filename), 'r') as f:
+                print(f.read())
+    else:
+        print("[i] No local client configs found.")
+
 
 def remove_peer():
     """Remove a peer from the WireGuard server."""
+    if IS_WINDOWS:
+        print("\n[!] Removing a server peer is only supported on Linux.")
+        return
     if not os.path.exists(SERVER_CONFIG_FILE):
         print("\n[!] Server not configured yet.")
         return
@@ -283,15 +383,15 @@ def remove_peer():
     peer_conf.read(peer_config_path)
     try:
         peer_ip = peer_conf['Interface']['Address'].split('/')[0]
-        
+
         output = subprocess.check_output("wg show wg0 dump", shell=True).decode().strip().split('\n')
         peer_pubkey = None
         for line in output[1:]: # Skip header
-             parts = line.split('\t')
-             if len(parts) > 3 and parts[3].split('/')[0] == peer_ip:
-                 peer_pubkey = parts[0]
-                 break
-        
+            parts = line.split('\t')
+            if len(parts) > 3 and parts[3].split('/')[0] == peer_ip:
+                peer_pubkey = parts[0]
+                break
+
         if not peer_pubkey:
             print(f"[!] Could not find public key for peer with IP {peer_ip}. Manual removal may be needed.")
             return
@@ -309,6 +409,9 @@ def remove_peer():
 
 def view_configs():
     """View server and peer configurations."""
+    if IS_WINDOWS:
+        print("\n[!] Viewing Linux server configs is not available on Windows. Use 'View Local Configs'.")
+        return
     print("\n--- Server Configuration (wg0.conf) ---")
     if os.path.exists(SERVER_CONFIG_FILE):
         try:
@@ -333,16 +436,19 @@ def view_configs():
 
 def refresh_and_fix_server():
     """Refreshes firewall rules and applies the current config."""
+    if IS_WINDOWS:
+        print("\n[!] Refresh/Fix is only supported on Linux.")
+        return
     if not os.path.exists(SERVER_CONFIG_FILE):
         print("\n[!] Server not configured yet. Nothing to fix.")
         return
 
     print("\n[*] Refreshing and fixing server configuration...")
-    
+
     # Read existing config to preserve essential data
     config = configparser.ConfigParser()
     config.read(SERVER_CONFIG_FILE)
-    
+
     try:
         # Re-detect primary interface for firewall rules
         primary_interface = get_primary_interface()
@@ -351,14 +457,14 @@ def refresh_and_fix_server():
         # Re-generate firewall rules, escaping the '%' for configparser
         post_up = f"iptables -A FORWARD -i %%i -j ACCEPT; iptables -t nat -A POSTROUTING -o {primary_interface} -j MASQUERADE"
         post_down = f"iptables -D FORWARD -i %%i -j ACCEPT; iptables -t nat -D POSTROUTING -o {primary_interface} -j MASQUERADE"
-        
+
         config.set('Interface', 'PostUp', post_up)
         config.set('Interface', 'PostDown', post_down)
 
         # Rewrite the config file with the corrected rules
         with open(SERVER_CONFIG_FILE, 'w') as configfile:
             config.write(configfile)
-        
+
         print("[*] Server configuration file updated with correct firewall rules.")
 
         # Restart the service to apply changes
@@ -377,6 +483,9 @@ def refresh_and_fix_server():
 
 def full_wipe():
     """Completely remove WireGuard, all configs, and system changes."""
+    if IS_WINDOWS:
+        print("\n[!] Full wipe is only supported on Linux. On Windows, uninstall WireGuard from Apps & Features and delete local configs if needed.")
+        return
     print("\n[!] WARNING: This will perform a full wipe. It will stop WireGuard, remove all configurations,")
     print("             uninstall the package, and revert system changes (like IP forwarding).")
     confirm = input("Are you absolutely sure you want to continue? [y/N]: ").lower()
@@ -426,12 +535,30 @@ def full_wipe():
             subprocess.run(["pacman", "-Rns", "--noconfirm", "wireguard-tools"], check=True, capture_output=True)
     except Exception as e:
         print(f"[!] Failed to uninstall packages: {e}")
-    
+
     print("\n[+] WireGuard has been completely wiped from the system.")
 
 def main_menu():
     """Display the main menu and handle user input."""
     while True:
+        if IS_WINDOWS:
+            print("\n--- WireGuard Helper (Windows) ---")
+            print("1. Generate Client Config")
+            print("2. View Local Client Configs")
+            print("3. Exit")
+            choice = input("Enter your choice: ")
+
+            if choice == '1':
+                generate_client_config_windows()
+            elif choice == '2':
+                view_local_configs_windows()
+            elif choice == '3':
+                print("\nGoodbye!\n")
+                break
+            else:
+                print("\n[!] Invalid choice. Please try again.")
+            continue
+
         print("\n--- WireGuard Easy Setup ---")
         print("1. Install WireGuard")
         print("2. Configure Server (run this first)")
